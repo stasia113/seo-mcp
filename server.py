@@ -1,125 +1,99 @@
-from pathlib import Path
-import pandas as pd
+from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
-
-from gsc import (
-    get_excel_file,
-    get_project_config,
-    get_dataset_config,
-    list_projects,
-    load_sheet,
-)
-
-from analysis import (
-    analyze_sheet_overview,
-    find_click_losses,
-    find_gsc_opportunities,
-    diagnose_performance_losses,
-    diagnose_commercial_page_losses,
-    seo_summary,
-)
-
-from html_report import build_html_report, build_combined_html_report
 
 
 mcp = MCPServer("SEO MCP")
 
 
-@mcp.tool()
-def projects() -> dict:
-    """Show configured SEO projects and their GSC datasets."""
-    return list_projects()
+# ---------------------------------------------------------------------------
+# Inspector dropdown choices
+# ---------------------------------------------------------------------------
+
+SingleProjectChoice = Literal[
+    "FDP Mold Remediation",
+    "O2 Mold Testing",
+    "USA Clean Master",
+]
+
+SummaryProjectChoice = Literal[
+    "FDP Mold Remediation",
+    "O2 Mold Testing",
+    "USA Clean Master",
+    "All projects",
+]
+
+DatasetChoice = Literal[
+    "Last 3 months vs previous 3 months",
+    "Last 3 months vs same period last year",
+]
+
+SummaryDatasetChoice = Literal[
+    "Last 3 months vs previous 3 months",
+    "Last 3 months vs same period last year",
+    "Both comparisons",
+]
+
+SheetChoice = Literal[
+    "Queries",
+    "Pages",
+]
 
 
-@mcp.tool()
-def list_sheets(
-    project: str = "fdp",
-    dataset: str = "period"
-) -> dict:
-    """Show available sheets in a project's GSC workbook."""
-
-    file_path = get_excel_file(project, dataset)
-
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"GSC workbook not found: {file_path}"
-        )
-
-    excel = pd.ExcelFile(file_path)
-
-    return {
-        "project": project,
-        "dataset": dataset,
-        "brand": get_project_config(project)["brand"],
-        "file": file_path.name,
-        "sheets": excel.sheet_names,
-    }
+PROJECT_MAP = {
+    "FDP Mold Remediation": "fdp",
+    "O2 Mold Testing": "o2",
+    "USA Clean Master": "usa_clean_master",
+    "All projects": "all",
+}
 
 
-@mcp.tool()
-def preview_sheet(
-    sheet_name: str,
-    project: str = "fdp",
-    dataset: str = "period",
-    rows: int = 5
-) -> list[dict]:
-    """Preview rows from a project's Queries or Pages sheet."""
-
-    df = load_sheet(
-        sheet_name,
-        project=project,
-        dataset=dataset
-    )
-
-    return df.head(rows).to_dict(
-        orient="records"
-    )
+DATASET_MAP = {
+    "Last 3 months vs previous 3 months": "period",
+    "Last 3 months vs same period last year": "yoy",
+    "Both comparisons": "both",
+}
 
 
-@mcp.tool()
-def seo_overview(
-    sheet_name: str,
-    project: str = "fdp",
-    dataset: str = "period"
-) -> dict:
-    """Return a high-level GSC overview for Queries or Pages."""
-
-    return analyze_sheet_overview(
-        sheet_name,
-        project=project,
-        dataset=dataset
-    )
-
+# ---------------------------------------------------------------------------
+# Detailed analysis tools
+#
+# Heavy modules are imported inside the tool functions rather than when the
+# MCP server starts. This keeps Inspector initialization fast.
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def click_losses(
-    sheet_name: str,
-    project: str = "fdp",
-    dataset: str = "period",
-    limit: int = 25
+    sheet_name: SheetChoice,
+    project: SingleProjectChoice = "FDP Mold Remediation",
+    dataset: DatasetChoice = "Last 3 months vs previous 3 months",
+    limit: int = 25,
 ) -> list[dict]:
-    """Find the largest click losses."""
+    """Find the largest click losses for Queries or Pages."""
+
+    from analysis import find_click_losses
 
     return find_click_losses(
         sheet_name,
         limit=limit,
-        project=project,
-        dataset=dataset
+        project=PROJECT_MAP[project],
+        dataset=DATASET_MAP[dataset],
     )
 
 
 @mcp.tool()
 def gsc_opportunities(
-    sheet_name: str,
-    project: str = "fdp",
-    dataset: str = "period",
+    sheet_name: SheetChoice,
+    project: SingleProjectChoice = "FDP Mold Remediation",
+    dataset: DatasetChoice = "Last 3 months vs previous 3 months",
     min_impressions: int = 100,
     min_position: float = 4,
     max_position: float = 20,
-    limit: int = 25
+    limit: int = 25,
 ) -> list[dict]:
     """Find SEO opportunities in comparison-based GSC data."""
+
+    from analysis import find_gsc_opportunities
 
     return find_gsc_opportunities(
         sheet_name,
@@ -127,47 +101,55 @@ def gsc_opportunities(
         min_position=min_position,
         max_position=max_position,
         limit=limit,
-        project=project,
-        dataset=dataset
+        project=PROJECT_MAP[project],
+        dataset=DATASET_MAP[dataset],
     )
 
 
 @mcp.tool()
 def performance_loss_diagnosis(
-    sheet_name: str,
-    project: str = "fdp",
-    dataset: str = "period",
-    limit: int = 25
+    sheet_name: SheetChoice,
+    project: SingleProjectChoice = "FDP Mold Remediation",
+    dataset: DatasetChoice = "Last 3 months vs previous 3 months",
+    limit: int = 25,
 ) -> list[dict]:
-    """Diagnose the largest click losses."""
+    """Diagnose the largest click losses for Queries or Pages."""
+
+    from analysis import diagnose_performance_losses
 
     return diagnose_performance_losses(
         sheet_name,
         limit=limit,
-        project=project,
-        dataset=dataset
+        project=PROJECT_MAP[project],
+        dataset=DATASET_MAP[dataset],
     )
 
 
 @mcp.tool()
 def commercial_page_performance_loss_diagnosis(
-    project: str = "fdp",
-    dataset: str = "period",
-    limit: int = 25
+    project: SingleProjectChoice = "FDP Mold Remediation",
+    dataset: DatasetChoice = "Last 3 months vs previous 3 months",
+    limit: int = 25,
 ) -> list[dict]:
     """Diagnose click losses among commercial pages only."""
 
+    from analysis import diagnose_commercial_page_losses
+
     return diagnose_commercial_page_losses(
         limit=limit,
-        project=project,
-        dataset=dataset
+        project=PROJECT_MAP[project],
+        dataset=DATASET_MAP[dataset],
     )
 
 
+# ---------------------------------------------------------------------------
+# Main SEO report tool
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def seo_summary_tool(
-    project: str = "fdp",
-    dataset: str = "both",
+    project: SummaryProjectChoice = "FDP Mold Remediation",
+    dataset: SummaryDatasetChoice = "Both comparisons",
     min_impressions: int = 100,
     opportunity_limit: int = 10,
     loss_limit: int = 10,
@@ -177,34 +159,108 @@ def seo_summary_tool(
     cluster_limit: int = 50,
 ) -> dict:
     """
-    Analyze one or both GSC datasets for a project and generate an HTML report.
+    Analyze GSC data and generate the SEO HTML report.
 
-    dataset='period' = last 3 months vs previous 3 months.
-    dataset='yoy' = last 3 months vs same period last year.
-    dataset='both' = both comparisons plus a cross-comparison report.
+    Project and dataset are presented as dropdowns in MCP Inspector.
 
-    Use project='all' to generate reports for every configured project
-    whose requested workbook(s) exist.
+    Dataset options:
+    - Last 3 months vs previous 3 months
+    - Last 3 months vs same period last year
+    - Both comparisons
+
+    The HTML report uses semantic query clusters for query-related tables.
     """
 
-    project = project.lower().strip()
-    dataset = dataset.lower().strip()
+    project_key = PROJECT_MAP[project]
+    dataset_key = DATASET_MAP[dataset]
 
-    if dataset not in {"period", "yoy", "both"}:
-        raise ValueError("dataset must be 'period', 'yoy', or 'both'.")
-
-    def run_one(project_name: str, dataset_name: str) -> dict:
-        summary = seo_summary(
-            project=project_name,
-            dataset=dataset_name,
-            min_impressions=min_impressions,
-            opportunity_limit=opportunity_limit,
-            loss_limit=loss_limit,
-            cluster_queries=cluster_queries,
-            cluster_similarity_threshold=cluster_similarity_threshold,
-            cluster_model=cluster_model,
-            cluster_limit=cluster_limit,
+    if project_key == "all":
+        project_names = (
+            "fdp",
+            "o2",
+            "usa_clean_master",
         )
+
+        results = {}
+        missing = {}
+
+        for project_name in project_names:
+            try:
+                results[project_name] = _run_project(
+                    project_name,
+                    dataset_key,
+                    min_impressions,
+                    opportunity_limit,
+                    loss_limit,
+                    cluster_queries,
+                    cluster_similarity_threshold,
+                    cluster_model,
+                    cluster_limit,
+                )
+            except FileNotFoundError as exc:
+                missing[project_name] = str(exc)
+
+        return {
+            "project": "all",
+            "dataset": dataset_key,
+            "reports": results,
+            "missing": missing,
+        }
+
+    return _run_project(
+        project_key,
+        dataset_key,
+        min_impressions,
+        opportunity_limit,
+        loss_limit,
+        cluster_queries,
+        cluster_similarity_threshold,
+        cluster_model,
+        cluster_limit,
+    )
+
+
+def _run_project(
+    project: str,
+    dataset: str,
+    min_impressions: int,
+    opportunity_limit: int,
+    loss_limit: int,
+    cluster_queries: bool,
+    cluster_similarity_threshold: float,
+    cluster_model: str,
+    cluster_limit: int,
+) -> dict:
+    """Run one project for one or both comparison datasets."""
+
+    # Keep GSC/pandas imports out of MCP startup.
+    from gsc import get_excel_file, get_project_config
+    from html_report import (
+        build_html_report,
+        build_combined_html_report,
+    )
+
+    period_path = get_excel_file(project, "period")
+    yoy_path = get_excel_file(project, "yoy")
+
+    if dataset == "period":
+        if not period_path.exists():
+            raise FileNotFoundError(
+                f"Period workbook not found: {period_path}"
+            )
+
+        summary = _run_summary(
+            project,
+            "period",
+            min_impressions,
+            opportunity_limit,
+            loss_limit,
+            cluster_queries,
+            cluster_similarity_threshold,
+            cluster_model,
+            cluster_limit,
+        )
+
         report_path = build_html_report(summary)
         summary["report"] = {
             "html_file": report_path.name,
@@ -212,63 +268,76 @@ def seo_summary_tool(
         }
         return summary
 
-    def run_project(project_name: str) -> dict:
-        period_path = get_excel_file(project_name, "period")
-        yoy_path = get_excel_file(project_name, "yoy")
+    if dataset == "yoy":
+        if not yoy_path.exists():
+            raise FileNotFoundError(
+                f"YoY workbook not found: {yoy_path}"
+            )
 
-        if dataset == "period":
-            if not period_path.exists():
-                raise FileNotFoundError(f"Period workbook not found: {period_path}")
-            return run_one(project_name, "period")
+        summary = _run_summary(
+            project,
+            "yoy",
+            min_impressions,
+            opportunity_limit,
+            loss_limit,
+            cluster_queries,
+            cluster_similarity_threshold,
+            cluster_model,
+            cluster_limit,
+        )
 
-        if dataset == "yoy":
-            if not yoy_path.exists():
-                raise FileNotFoundError(f"YoY workbook not found: {yoy_path}")
-            return run_one(project_name, "yoy")
+        report_path = build_html_report(summary)
+        summary["report"] = {
+            "html_file": report_path.name,
+            "html_path": str(report_path),
+        }
+        return summary
 
+    if dataset == "both":
         if not period_path.exists() or not yoy_path.exists():
             missing = []
             if not period_path.exists():
                 missing.append(f"period: {period_path}")
             if not yoy_path.exists():
                 missing.append(f"yoy: {yoy_path}")
+
             raise FileNotFoundError(
-                f"Both datasets are required for project='{project_name}'. "
+                f"Both datasets are required for project='{project}'. "
                 + "; ".join(missing)
             )
 
-        period_summary = seo_summary(
-            project=project_name,
-            dataset="period",
-            min_impressions=min_impressions,
-            opportunity_limit=opportunity_limit,
-            loss_limit=loss_limit,
-            cluster_queries=cluster_queries,
-            cluster_similarity_threshold=cluster_similarity_threshold,
-            cluster_model=cluster_model,
-            cluster_limit=cluster_limit,
+        period_summary = _run_summary(
+            project,
+            "period",
+            min_impressions,
+            opportunity_limit,
+            loss_limit,
+            cluster_queries,
+            cluster_similarity_threshold,
+            cluster_model,
+            cluster_limit,
         )
 
-        yoy_summary = seo_summary(
-            project=project_name,
-            dataset="yoy",
-            min_impressions=min_impressions,
-            opportunity_limit=opportunity_limit,
-            loss_limit=loss_limit,
-            cluster_queries=cluster_queries,
-            cluster_similarity_threshold=cluster_similarity_threshold,
-            cluster_model=cluster_model,
-            cluster_limit=cluster_limit,
+        yoy_summary = _run_summary(
+            project,
+            "yoy",
+            min_impressions,
+            opportunity_limit,
+            loss_limit,
+            cluster_queries,
+            cluster_similarity_threshold,
+            cluster_model,
+            cluster_limit,
         )
 
         report_path = build_combined_html_report(
             period_summary,
-            yoy_summary
+            yoy_summary,
         )
 
         return {
-            "project": project_name,
-            "brand": get_project_config(project_name)["brand"],
+            "project": project,
+            "brand": get_project_config(project)["brand"],
             "dataset": "both",
             "period": period_summary,
             "yoy": yoy_summary,
@@ -278,24 +347,37 @@ def seo_summary_tool(
             },
         }
 
-    if project == "all":
-        results = {}
-        missing = {}
+    raise ValueError(
+        "dataset must be 'period', 'yoy', or 'both'."
+    )
 
-        for project_name in ("fdp", "o2", "usa_clean_master"):
-            try:
-                results[project_name] = run_project(project_name)
-            except FileNotFoundError as exc:
-                missing[project_name] = str(exc)
 
-        return {
-            "project": "all",
-            "dataset": dataset,
-            "reports": results,
-            "missing": missing,
-        }
+def _run_summary(
+    project: str,
+    dataset: str,
+    min_impressions: int,
+    opportunity_limit: int,
+    loss_limit: int,
+    cluster_queries: bool,
+    cluster_similarity_threshold: float,
+    cluster_model: str,
+    cluster_limit: int,
+) -> dict:
+    """Run the existing analysis layer for one dataset."""
 
-    return run_project(project)
+    from analysis import seo_summary
+
+    return seo_summary(
+        project=project,
+        dataset=dataset,
+        min_impressions=min_impressions,
+        opportunity_limit=opportunity_limit,
+        loss_limit=loss_limit,
+        cluster_queries=cluster_queries,
+        cluster_similarity_threshold=cluster_similarity_threshold,
+        cluster_model=cluster_model,
+        cluster_limit=cluster_limit,
+    )
 
 
 if __name__ == "__main__":

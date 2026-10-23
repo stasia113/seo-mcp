@@ -1,24 +1,35 @@
 """
-Semantic query clustering for GSC analysis.
+Fast semantic query clustering for GSC analysis.
 
-Uses sentence-transformers locally to group semantically similar search
-queries. Clusters are built from the union of query strings across the
-available datasets so that period and YoY reports use the same topic groups.
+This module is designed for the SEO MCP server. It uses Sentence Transformers
+for embeddings and Sentence Transformers' fast community detection instead of
+sklearn AgglomerativeClustering.
+
+The expensive embedding and clustering results are cached on disk. The cache
+key includes the query universe, model, and similarity threshold, so period and
+YoY datasets can share one cluster map when they contain the same query universe.
 """
 
 from __future__ import annotations
 
-from hashlib import sha1
+import json
+from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import AgglomerativeClustering
 
 
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_SIMILARITY_THRESHOLD = 0.78
-DEFAULT_MAX_MEMBER_QUERIES = 10
+DEFAULT_MIN_COMMUNITY_SIZE = 2
+DEFAULT_EMBED_BATCH_SIZE = 64
+DEFAULT_COMMUNITY_BATCH_SIZE = 1024
+CACHE_VERSION = "v2-fast-community"
+
+CACHE_DIR = Path(__file__).parent / "cache" / "query_clustering"
 
 
 def _normalize_query(value: object) -> str:
@@ -33,7 +44,10 @@ def _display_query(value: object) -> str:
     return " ".join(str(value).strip().split())
 
 
+@lru_cache(maxsize=2)
 def _cluster_model(model_name: str):
+    """Load the embedding model once per server process."""
+
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -45,22 +59,174 @@ def _cluster_model(model_name: str):
     return SentenceTransformer(model_name)
 
 
-def _make_agglomerative(distance_threshold: float):
+def _cache_key(
+    queries: list[str],
+    model_name: str,
+    similarity_threshold: float,
+) -> str:
+    payload = json.dumps(
+        {
+            "version": CACHE_VERSION,
+            "queries": queries,
+            "model": model_name,
+            "threshold": similarity_threshold,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return sha256(payload).hexdigest()[:24]
+
+
+def _cache_paths(cache_key: str) -> tuple[Path, Path]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return (
+        CACHE_DIR / f"{cache_key}.clusters.json",
+        CACHE_DIR / f"{cache_key}.embeddings.npy",
+    )
+
+
+def _load_cached_clusters(path: Path) -> dict[str, dict] | None:
+    if not path.exists():
+        return None
+
     try:
-        return AgglomerativeClustering(
-            n_clusters=None,
-            metric="cosine",
-            linkage="average",
-            distance_threshold=distance_threshold,
-        )
-    except TypeError:
-        # Compatibility with older scikit-learn versions.
-        return AgglomerativeClustering(
-            n_clusters=None,
-            affinity="cosine",
-            linkage="average",
-            distance_threshold=distance_threshold,
-        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != CACHE_VERSION:
+            return None
+        return payload.get("clusters")
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_cached_clusters(
+    path: Path,
+    clusters: dict[str, dict],
+    queries: list[str],
+    model_name: str,
+    similarity_threshold: float,
+) -> None:
+    payload = {
+        "version": CACHE_VERSION,
+        "model": model_name,
+        "similarity_threshold": similarity_threshold,
+        "query_count": len(queries),
+        "clusters": clusters,
+    }
+
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_or_create_embeddings(
+    queries: list[str],
+    model_name: str,
+    cache_key: str,
+) -> np.ndarray:
+    _, embedding_path = _cache_paths(cache_key)
+
+    if embedding_path.exists():
+        try:
+            embeddings = np.load(embedding_path, allow_pickle=False)
+            if embeddings.shape[0] == len(queries):
+                return embeddings
+        except (OSError, ValueError):
+            pass
+
+    model = _cluster_model(model_name)
+
+    embeddings = model.encode(
+        [queries[i] for i in range(len(queries))],
+        batch_size=DEFAULT_EMBED_BATCH_SIZE,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    np.save(embedding_path, embeddings, allow_pickle=False)
+    return embeddings
+
+
+def _choose_cluster_label(
+    members: list[int],
+    queries: list[str],
+) -> str:
+    """Choose a readable label from a community's central/concise queries."""
+
+    if not members:
+        return ""
+
+    # community_detection returns its central point first. Prefer that point,
+    # unless a clearly shorter query is available among the first few members.
+    candidates = [queries[index] for index in members[:5]]
+    central = candidates[0]
+
+    shortest = min(
+        candidates,
+        key=lambda value: (
+            len(value.split()),
+            len(value),
+            value,
+        ),
+    )
+
+    # Avoid replacing a useful central label with an ultra-short generic term.
+    if len(shortest.split()) >= 2 and len(shortest) <= len(central) * 0.8:
+        return shortest
+
+    return central
+
+
+def _cluster_id(member_queries: list[str]) -> str:
+    payload = "\n".join(sorted(member_queries)).encode("utf-8")
+    return "cluster_" + sha256(payload).hexdigest()[:12]
+
+
+def _build_communities(
+    embeddings: np.ndarray,
+    queries: list[str],
+    similarity_threshold: float,
+) -> list[list[int]]:
+    """Run Sentence Transformers' fast community detection."""
+
+    try:
+        from sentence_transformers.util import community_detection
+    except ImportError as exc:
+        raise ImportError(
+            "The installed sentence-transformers version does not expose "
+            "community_detection. Upgrade sentence-transformers."
+        ) from exc
+
+    communities = community_detection(
+        embeddings,
+        threshold=similarity_threshold,
+        min_community_size=DEFAULT_MIN_COMMUNITY_SIZE,
+        batch_size=DEFAULT_COMMUNITY_BATCH_SIZE,
+        show_progress_bar=False,
+    )
+
+    # Communities can overlap. Assign a query to the first community that
+    # contains it so every query receives exactly one cluster.
+    assigned: set[int] = set()
+    unique_communities: list[list[int]] = []
+
+    for community in communities:
+        members = [int(index) for index in community if int(index) not in assigned]
+        if not members:
+            continue
+
+        assigned.update(members)
+        unique_communities.append(members)
+
+    # Queries not placed in a multi-query community remain singleton clusters.
+    for index in range(len(queries)):
+        if index not in assigned:
+            unique_communities.append([index])
+
+    return unique_communities
 
 
 def build_cluster_map(
@@ -70,10 +236,11 @@ def build_cluster_map(
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> dict[str, dict]:
     """
-    Build a stable semantic cluster map from one or more query datasets.
+    Build a semantic cluster map from one or more query datasets.
 
-    The input frames may come from the period and YoY exports. Only the query
-    text is used to build clusters. Metrics are aggregated later per dataset.
+    The function preserves the original public interface used by analysis.py.
+    The query universe is deduplicated and sorted before caching, which makes
+    the result independent of workbook row order.
     """
 
     records: dict[str, str] = {}
@@ -96,43 +263,36 @@ def build_cluster_map(
     if not queries:
         return {}
 
-    if len(queries) == 1:
-        only = queries[0]
-        cluster_id = _cluster_id([only])
-        return {
-            only: {
-                "cluster_id": cluster_id,
-                "label": records[only],
-                "members": [records[only]],
-            }
-        }
+    cache_key = _cache_key(
+        queries,
+        model_name,
+        similarity_threshold,
+    )
+    cluster_path, _ = _cache_paths(cache_key)
 
-    model = _cluster_model(model_name)
-    embeddings = model.encode(
-        [records[q] for q in queries],
-        normalize_embeddings=True,
-        show_progress_bar=False,
+    cached = _load_cached_clusters(cluster_path)
+    if cached is not None:
+        return cached
+
+    embeddings = _load_or_create_embeddings(
+        queries,
+        model_name,
+        cache_key,
     )
 
-    distance_threshold = 1.0 - similarity_threshold
-    clustering = _make_agglomerative(distance_threshold)
-    labels = clustering.fit_predict(np.asarray(embeddings))
-
-    grouped: dict[int, list[str]] = {}
-    for query, label in zip(queries, labels):
-        grouped.setdefault(int(label), []).append(query)
+    communities = _build_communities(
+        embeddings,
+        queries,
+        similarity_threshold,
+    )
 
     result: dict[str, dict] = {}
 
-    for members in grouped.values():
-        cluster_id = _cluster_id(members)
-        display_members = [records[q] for q in members]
-        label = _choose_cluster_label(
-            members,
-            records,
-            embeddings,
-            queries,
-        )
+    for members in communities:
+        member_queries = [queries[index] for index in members]
+        cluster_id = _cluster_id(member_queries)
+        label = _choose_cluster_label(members, queries)
+        display_members = [records[query] for query in member_queries]
 
         info = {
             "cluster_id": cluster_id,
@@ -140,67 +300,31 @@ def build_cluster_map(
             "members": sorted(display_members),
         }
 
-        for member in members:
-            result[member] = info
+        for query in member_queries:
+            result[query] = info
+
+    _save_cached_clusters(
+        cluster_path,
+        result,
+        queries,
+        model_name,
+        similarity_threshold,
+    )
 
     return result
-
-
-def _cluster_id(members: list[str]) -> str:
-    payload = "\n".join(sorted(members)).encode("utf-8")
-    return "cluster_" + sha1(payload).hexdigest()[:12]
-
-
-def _choose_cluster_label(
-    members: list[str],
-    records: dict[str, str],
-    embeddings: np.ndarray,
-    all_queries: list[str],
-) -> str:
-    """Choose a readable representative query, favoring central and concise text."""
-
-    index = {query: i for i, query in enumerate(all_queries)}
-    member_indices = [index[q] for q in members]
-    member_vectors = embeddings[member_indices]
-
-    centroid = member_vectors.mean(axis=0)
-    norm = np.linalg.norm(centroid)
-    if norm:
-        centroid = centroid / norm
-
-    similarities = member_vectors @ centroid
-    ranked = sorted(
-        zip(members, similarities),
-        key=lambda item: (-float(item[1]), len(item[0].split()), item[0]),
-    )
-
-    # Prefer a concise representative among the strongest central queries.
-    top = ranked[: min(5, len(ranked))]
-    best = min(
-        top,
-        key=lambda item: (
-            len(item[0].split()),
-            len(item[0]),
-            -float(item[1]),
-            item[0],
-        ),
-    )
-
-    return records[best[0]]
 
 
 def aggregate_query_clusters(
     df: pd.DataFrame,
     columns: dict,
     cluster_map: dict[str, dict],
-    max_member_queries: int = DEFAULT_MAX_MEMBER_QUERIES,
+    max_member_queries: int = 10,
 ) -> list[dict]:
     """
     Aggregate current/comparison GSC metrics by semantic cluster.
 
     CTR is recalculated from summed clicks / summed impressions.
-    Position is impressions-weighted. This avoids averaging CTRs or treating
-    every query's position as equally representative of the cluster.
+    Position is impressions-weighted.
     """
 
     query_column = columns["key_column"]
@@ -227,10 +351,13 @@ def aggregate_query_clusters(
                 .astype(str)
                 .str.replace("%", "", regex=False)
             )
-        work[column] = pd.to_numeric(work[column], errors="coerce").fillna(0)
+        work[column] = pd.to_numeric(
+            work[column],
+            errors="coerce",
+        ).fillna(0)
 
     work["_cluster_id"] = work["_normalized_query"].map(
-        lambda q: cluster_map[q]["cluster_id"]
+        lambda query: cluster_map[query]["cluster_id"]
     )
 
     rows = []
@@ -239,17 +366,25 @@ def aggregate_query_clusters(
         first_query = group["_normalized_query"].iloc[0]
         info = cluster_map[first_query]
 
-        current_clicks = float(group[columns["current_clicks"]].sum())
-        comparison_clicks = float(group[columns["comparison_clicks"]].sum())
-        current_impressions = float(group[columns["current_impressions"]].sum())
-        comparison_impressions = float(group[columns["comparison_impressions"]].sum())
+        current_clicks = float(
+            group[columns["current_clicks"]].sum()
+        )
+        comparison_clicks = float(
+            group[columns["comparison_clicks"]].sum()
+        )
+        current_impressions = float(
+            group[columns["current_impressions"]].sum()
+        )
+        comparison_impressions = float(
+            group[columns["comparison_impressions"]].sum()
+        )
 
         current_ctr = (
-            current_clicks / current_impressions
+            current_clicks / current_impressions * 100
             if current_impressions > 0 else 0.0
         )
         comparison_ctr = (
-            comparison_clicks / comparison_impressions
+            comparison_clicks / comparison_impressions * 100
             if comparison_impressions > 0 else 0.0
         )
 
@@ -269,25 +404,32 @@ def aggregate_query_clusters(
         ctr_change = current_ctr - comparison_ctr
         position_change = current_position - comparison_position
 
-        diagnosis = _diagnose(
-            click_change,
-            impression_change,
-            ctr_change,
-            position_change,
+        diagnosis = (
+            _diagnose(
+                click_change,
+                impression_change,
+                ctr_change,
+                position_change,
+            )
+            if click_change < 0
+            else "No click loss"
         )
 
         member_query_rows = []
         group = group.copy()
         group["_display_query"] = group[query_column].map(_display_query)
         group = group.sort_values(
-            columns["current_clicks"], ascending=False
+            columns["current_clicks"],
+            ascending=False,
         )
 
         for _, row in group.head(max_member_queries).iterrows():
             member_query_rows.append({
                 "query": row["_display_query"],
                 "clicks": _number(row[columns["current_clicks"]]),
-                "impressions": _number(row[columns["current_impressions"]]),
+                "impressions": _number(
+                    row[columns["current_impressions"]]
+                ),
             })
 
         rows.append({
@@ -329,18 +471,31 @@ def _weighted_position(
     position_column: str,
     weight_column: str,
 ) -> float:
-    positions = pd.to_numeric(group[position_column], errors="coerce").fillna(0)
-    weights = pd.to_numeric(group[weight_column], errors="coerce").fillna(0)
+    positions = pd.to_numeric(
+        group[position_column],
+        errors="coerce",
+    ).fillna(0)
+    weights = pd.to_numeric(
+        group[weight_column],
+        errors="coerce",
+    ).fillna(0)
     total_weight = float(weights.sum())
 
     if total_weight > 0:
-        return float((positions * weights).sum() / total_weight)
+        return float(
+            (positions * weights).sum() / total_weight
+        )
 
     nonzero = positions[positions > 0]
     return float(nonzero.mean()) if not nonzero.empty else 0.0
 
 
-def _diagnose(click_change, impression_change, ctr_change, position_change):
+def _diagnose(
+    click_change,
+    impression_change,
+    ctr_change,
+    position_change,
+):
     if position_change > 1 and impression_change < 0 and ctr_change < 0:
         return "Ranking, visibility and CTR decline"
     if position_change > 1 and impression_change < 0:
