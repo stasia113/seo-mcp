@@ -11,6 +11,7 @@ from gsc import (
     get_commercial_exclusions,
     get_commercial_inclusions,
     get_commercial_excluded_contains,
+    get_commercial_location_tokens,
 )
 
 from query_clustering import (
@@ -670,6 +671,11 @@ def diagnose_commercial_page_losses(
         for value in get_commercial_excluded_contains(project)
     ]
 
+    location_tokens = [
+        value.lower()
+        for value in get_commercial_location_tokens(project)
+    ]
+
     def is_commercial_page(value):
         if pd.isna(value):
             return False
@@ -690,12 +696,34 @@ def diagnose_commercial_page_losses(
         path = urlparse(url).path.lower()
 
         # Some projects use an explicit commercial-page allowlist.
-        # When present, a page must be nested under one of these prefixes.
+        # When present, the URL must first match one of the requested
+        # service families.
         if include_prefixes:
-            return any(
+            service_match = any(
                 path.startswith(prefix)
                 for prefix in include_prefixes
             )
+
+            if not service_match:
+                return False
+
+            # USA Clean Master has an additional location allowlist.
+            # Normalize the path so both "silver-spring" and
+            # "silverspring", as well as similar legacy URL formats,
+            # resolve to the same location token.
+            if project.lower() == "usa_clean_master" and location_tokens:
+                normalized_path = "".join(
+                    character
+                    for character in path
+                    if character.isalnum()
+                )
+
+                return any(
+                    token in normalized_path
+                    for token in location_tokens
+                )
+
+            return True
 
         path_segments = {
             segment
@@ -1404,6 +1432,8 @@ def seo_summary(
             ],
 
             "included_prefixes": get_commercial_inclusions(project),
+
+            "included_locations": get_commercial_location_tokens(project),
 
             "excluded_contains": get_commercial_excluded_contains(project),
 

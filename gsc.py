@@ -48,13 +48,35 @@ PROJECTS = {
     },
     "usa_clean_master": {
         "brand": "USA Clean Master",
-        # For USA Clean Master, the commercial-page analysis is an allowlist,
-        # not a general exclusion filter. Only URLs under these paths qualify.
+        # Commercial-page analysis is restricted to the requested services
+        # and requested locations. Informational pages remain in the general
+        # Pages analysis.
         "commercial_include_prefixes": [
             "/carpetcleaning/",
             "/rugcleaning/",
             "/upholsterycleaning/",
-            "/mattress-cleaning.aspx",
+            "/mattress-cleaning",
+            "/carpet-cleaning-",
+            "/rug-cleaning-",
+            "/upholstery-cleaning-",
+            "/mattress-cleaning-",
+        ],
+        "commercial_location_tokens": [
+            "washingtondc",
+            "rockville",
+            "silverspring",
+            "germantown",
+            "reston",
+            "manassas",
+            "bethesda",
+            "gaithersburg",
+            "potomac",
+            "baltimore",
+            "newjersey",
+            "fortlauderdale",
+            "plantation",
+            "bocaraton",
+            "miami",
         ],
         "commercial_excluded_contains": ["#"],
         "commercial_excluded_sections": COMMON_COMMERCIAL_EXCLUSIONS + ["knowledge-base"],
@@ -101,6 +123,12 @@ def get_commercial_excluded_contains(project: str = "fdp") -> list[str]:
     """Return literal strings that disqualify a URL from the commercial-page view."""
     config = get_project_config(project)
     return list(config.get("commercial_excluded_contains", []))
+
+
+def get_commercial_location_tokens(project: str = "fdp") -> list[str]:
+    """Return normalized location tokens allowed in the commercial-page view."""
+    config = get_project_config(project)
+    return list(config.get("commercial_location_tokens", []))
 
 def get_dataset_config(
     project: str = "fdp",
@@ -152,6 +180,7 @@ def list_projects() -> dict:
                         for section in get_commercial_exclusions(project)
                     ],
                     "commercial_include_prefixes": get_commercial_inclusions(project),
+                    "commercial_location_tokens": get_commercial_location_tokens(project),
                     "commercial_excluded_contains": get_commercial_excluded_contains(project),
                 }
                 for name, dataset_config in config["datasets"].items()
