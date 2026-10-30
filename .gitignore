@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Google Search Console OAuth credentials
+credentials.json
+token.json
+
+# Local GSC refresh state and logs
+refresh/
+
+# Semantic clustering cache
+cache/
+
+# Generated live-GSC data and reports
+prepared/
+
+# Environment / secrets
+.env
+.env.*

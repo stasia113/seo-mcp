@@ -1,17 +1,22 @@
 """
-Fast semantic query clustering for GSC analysis.
+Semantic query clustering for large GSC datasets.
 
-This module is designed for the SEO MCP server. It uses Sentence Transformers
-for embeddings and Sentence Transformers' fast community detection instead of
-sklearn AgglomerativeClustering.
+Uses Sentence Transformers with the ONNX backend and AgglomerativeClustering
+on a bounded set of high-value representative queries. This configuration
+uses the same low-memory settings as the current remote server. All remaining queries
+are embedded in small batches and assigned to the nearest representative
+cluster. This preserves the preferred model and agglomerative clustering
+quality while avoiding the O(n^2) memory requirement of running agglomerative
+clustering across tens of thousands of queries.
 
-The expensive embedding and clustering results are cached on disk. The cache
-key includes the query universe, model, and similarity threshold, so period and
-YoY datasets can share one cluster map when they contain the same query universe.
+Public interface preserved for analysis.py:
+- build_cluster_map()
+- aggregate_query_clusters()
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 from functools import lru_cache
 from hashlib import sha256
@@ -22,12 +27,13 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_SIMILARITY_THRESHOLD = 0.78
-DEFAULT_MIN_COMMUNITY_SIZE = 2
-DEFAULT_EMBED_BATCH_SIZE = 64
-DEFAULT_COMMUNITY_BATCH_SIZE = 1024
-CACHE_VERSION = "v2-fast-community"
+DEFAULT_EMBED_BATCH_SIZE = 16
+DEFAULT_ASSIGN_BATCH_SIZE = 64
+DEFAULT_MAX_ANCHORS = 300
+DEFAULT_MAX_MEMBER_QUERIES = 10
+CACHE_VERSION = "v7-scalable-anchor-agglomerative-lowmem"
 
 CACHE_DIR = Path(__file__).parent / "cache" / "query_clustering"
 
@@ -44,32 +50,41 @@ def _display_query(value: object) -> str:
     return " ".join(str(value).strip().split())
 
 
+def _normalize_model_name(model_name: str) -> str:
+    if model_name == "all-MiniLM-L6-v2":
+        return DEFAULT_MODEL
+    return model_name
+
+
 @lru_cache(maxsize=2)
 def _cluster_model(model_name: str):
-    """Load the embedding model once per server process."""
-
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
         raise ImportError(
             "Semantic query clustering requires sentence-transformers. "
-            "Install it with: pip install sentence-transformers"
+            "Install it with ONNX support."
         ) from exc
 
-    return SentenceTransformer(model_name)
+    return SentenceTransformer(
+        _normalize_model_name(model_name),
+        backend="onnx",
+    )
 
 
 def _cache_key(
     queries: list[str],
     model_name: str,
     similarity_threshold: float,
+    max_anchors: int,
 ) -> str:
     payload = json.dumps(
         {
             "version": CACHE_VERSION,
             "queries": queries,
-            "model": model_name,
+            "model": _normalize_model_name(model_name),
             "threshold": similarity_threshold,
+            "max_anchors": max_anchors,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -81,8 +96,8 @@ def _cache_key(
 def _cache_paths(cache_key: str) -> tuple[Path, Path]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return (
-        CACHE_DIR / f"{cache_key}.clusters.json",
-        CACHE_DIR / f"{cache_key}.embeddings.npy",
+        CACHE_DIR / f"{cache_key}.clusters.json.gz",
+        CACHE_DIR / f"{cache_key}.anchors.npy",
     )
 
 
@@ -91,11 +106,31 @@ def _load_cached_clusters(path: Path) -> dict[str, dict] | None:
         return None
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
         if payload.get("version") != CACHE_VERSION:
             return None
-        return payload.get("clusters")
-    except (OSError, ValueError, TypeError):
+
+        assignments = payload.get("assignments", {})
+        definitions = payload.get("clusters", {})
+
+        info_by_id: dict[str, dict] = {}
+        for cluster_id, definition in definitions.items():
+            info_by_id[cluster_id] = {
+                "cluster_id": cluster_id,
+                "label": definition.get("label", ""),
+                "members": definition.get("members", []),
+            }
+
+        result: dict[str, dict] = {}
+        for query, cluster_id in assignments.items():
+            info = info_by_id.get(cluster_id)
+            if info is not None:
+                result[query] = info
+
+        return result
+    except (OSError, ValueError, TypeError, EOFError):
         return None
 
 
@@ -105,79 +140,193 @@ def _save_cached_clusters(
     queries: list[str],
     model_name: str,
     similarity_threshold: float,
+    max_anchors: int,
 ) -> None:
+    definitions: dict[str, dict] = {}
+    assignments: dict[str, str] = {}
+
+    for query, info in clusters.items():
+        cluster_id = info["cluster_id"]
+        assignments[query] = cluster_id
+
+        if cluster_id not in definitions:
+            definitions[cluster_id] = {
+                "label": info.get("label", ""),
+                "members": info.get("members", []),
+            }
+
     payload = {
         "version": CACHE_VERSION,
-        "model": model_name,
+        "model": _normalize_model_name(model_name),
         "similarity_threshold": similarity_threshold,
+        "max_anchors": max_anchors,
         "query_count": len(queries),
-        "clusters": clusters,
+        "assignments": assignments,
+        "clusters": definitions,
     }
 
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+    temporary_path = path.with_name(path.name + ".tmp")
+
+    with gzip.open(
+        temporary_path,
+        "wt",
         encoding="utf-8",
-    )
+        compresslevel=6,
+    ) as handle:
+        json.dump(
+            payload,
+            handle,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    temporary_path.replace(path)
 
 
 def _load_or_create_embeddings(
     queries: list[str],
     model_name: str,
     cache_key: str,
+    cache_name: str,
 ) -> np.ndarray:
     _, embedding_path = _cache_paths(cache_key)
+    embedding_path = embedding_path.with_name(cache_name)
 
     if embedding_path.exists():
         try:
-            embeddings = np.load(embedding_path, allow_pickle=False)
-            if embeddings.shape[0] == len(queries):
-                return embeddings
+            embeddings = np.load(
+                embedding_path,
+                allow_pickle=False,
+            )
+            if (
+                embeddings.ndim == 2
+                and embeddings.shape[0] == len(queries)
+            ):
+                return np.asarray(embeddings, dtype=np.float32)
         except (OSError, ValueError):
             pass
 
-    model = _cluster_model(model_name)
+    model = _cluster_model(_normalize_model_name(model_name))
 
     embeddings = model.encode(
-        [queries[i] for i in range(len(queries))],
+        queries,
         batch_size=DEFAULT_EMBED_BATCH_SIZE,
-        show_progress_bar=False,
+        show_progress_bar=True,
         normalize_embeddings=True,
         convert_to_numpy=True,
     )
 
     embeddings = np.asarray(embeddings, dtype=np.float32)
-    np.save(embedding_path, embeddings, allow_pickle=False)
+
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(queries):
+        raise ValueError(
+            "Unexpected embedding shape: "
+            f"{embeddings.shape}; expected ({len(queries)}, dimensions)."
+        )
+
+    np.save(
+        embedding_path,
+        embeddings,
+        allow_pickle=False,
+    )
+
     return embeddings
+
+
+def _frame_query_scores(
+    frame: pd.DataFrame,
+    query_column: str,
+) -> dict[str, float]:
+    """Return an importance score based on clicks and impressions when present."""
+
+    scores: dict[str, float] = {}
+
+    metric_columns = []
+    for column in frame.columns:
+        name = str(column).lower()
+        if "impression" in name or "click" in name:
+            metric_columns.append(column)
+
+    for _, row in frame[[query_column] + metric_columns].iterrows():
+        query = _normalize_query(row[query_column])
+        if not query:
+            continue
+
+        score = 0.0
+        for column in metric_columns:
+            value = pd.to_numeric(row[column], errors="coerce")
+            if pd.isna(value):
+                continue
+            name = str(column).lower()
+            if "impression" in name:
+                score += float(value)
+            elif "click" in name:
+                score += float(value) * 10.0
+
+        scores[query] = scores.get(query, 0.0) + score
+
+    return scores
+
+
+def _choose_anchors(
+    queries: list[str],
+    importance: dict[str, float],
+    max_anchors: int,
+) -> list[str]:
+    if len(queries) <= max_anchors:
+        return queries
+
+    ranked = sorted(
+        queries,
+        key=lambda query: (
+            -importance.get(query, 0.0),
+            len(query.split()),
+            len(query),
+            query,
+        ),
+    )
+
+    return ranked[:max_anchors]
 
 
 def _choose_cluster_label(
     members: list[int],
     queries: list[str],
+    embeddings: np.ndarray,
 ) -> str:
-    """Choose a readable label from a community's central/concise queries."""
-
     if not members:
         return ""
 
-    # community_detection returns its central point first. Prefer that point,
-    # unless a clearly shorter query is available among the first few members.
-    candidates = [queries[index] for index in members[:5]]
-    central = candidates[0]
+    member_vectors = embeddings[members]
+    centroid = member_vectors.mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
 
-    shortest = min(
-        candidates,
-        key=lambda value: (
-            len(value.split()),
-            len(value),
-            value,
+    if norm > 0:
+        centroid = centroid / norm
+
+    similarities = member_vectors @ centroid
+    ranked = sorted(
+        zip(members, similarities.tolist()),
+        key=lambda item: (
+            -float(item[1]),
+            len(queries[item[0]].split()),
+            len(queries[item[0]]),
+            queries[item[0]],
         ),
     )
 
-    # Avoid replacing a useful central label with an ultra-short generic term.
-    if len(shortest.split()) >= 2 and len(shortest) <= len(central) * 0.8:
-        return shortest
+    top = ranked[: min(5, len(ranked))]
+    best_index = min(
+        top,
+        key=lambda item: (
+            len(queries[item[0]].split()),
+            len(queries[item[0]]),
+            -float(item[1]),
+            queries[item[0]],
+        ),
+    )[0]
 
-    return central
+    return queries[best_index]
 
 
 def _cluster_id(member_queries: list[str]) -> str:
@@ -187,46 +336,109 @@ def _cluster_id(member_queries: list[str]) -> str:
 
 def _build_communities(
     embeddings: np.ndarray,
-    queries: list[str],
     similarity_threshold: float,
 ) -> list[list[int]]:
-    """Run Sentence Transformers' fast community detection."""
+    """Run the preferred average-linkage AgglomerativeClustering on anchors only."""
 
     try:
-        from sentence_transformers.util import community_detection
+        from sklearn.cluster import AgglomerativeClustering
     except ImportError as exc:
         raise ImportError(
-            "The installed sentence-transformers version does not expose "
-            "community_detection. Upgrade sentence-transformers."
+            "Semantic query clustering requires scikit-learn. "
+            "Install it with: python -m pip install scikit-learn"
         ) from exc
 
-    communities = community_detection(
-        embeddings,
-        threshold=similarity_threshold,
-        min_community_size=DEFAULT_MIN_COMMUNITY_SIZE,
-        batch_size=DEFAULT_COMMUNITY_BATCH_SIZE,
-        show_progress_bar=False,
-    )
+    if len(embeddings) == 0:
+        return []
 
-    # Communities can overlap. Assign a query to the first community that
-    # contains it so every query receives exactly one cluster.
-    assigned: set[int] = set()
-    unique_communities: list[list[int]] = []
+    if len(embeddings) == 1:
+        return [[0]]
 
-    for community in communities:
-        members = [int(index) for index in community if int(index) not in assigned]
-        if not members:
+    distance_threshold = 1.0 - float(similarity_threshold)
+
+    try:
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            metric="cosine",
+            linkage="average",
+            distance_threshold=distance_threshold,
+        )
+    except TypeError:
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            affinity="cosine",
+            linkage="average",
+            distance_threshold=distance_threshold,
+        )
+
+    labels = clustering.fit_predict(embeddings)
+
+    communities: dict[int, list[int]] = {}
+    for index, label in enumerate(labels.tolist()):
+        communities.setdefault(int(label), []).append(index)
+
+    return list(communities.values())
+
+
+def _assign_queries_to_anchor_clusters(
+    queries: list[str],
+    anchors: list[str],
+    anchor_embeddings: np.ndarray,
+    anchor_cluster_ids: np.ndarray,
+    anchor_cluster_info: dict[str, dict],
+    model_name: str,
+    similarity_threshold: float,
+) -> dict[str, dict]:
+    """Embed non-anchor queries in batches and assign them to nearest anchors."""
+
+    model = _cluster_model(_normalize_model_name(model_name))
+    result: dict[str, dict] = {}
+
+    anchor_matrix = np.asarray(anchor_embeddings, dtype=np.float32)
+    anchor_cluster_ids = np.asarray(anchor_cluster_ids)
+
+    anchor_set = set(anchors)
+
+    for start in range(0, len(queries), DEFAULT_ASSIGN_BATCH_SIZE):
+        batch_queries = queries[start:start + DEFAULT_ASSIGN_BATCH_SIZE]
+        pending = [query for query in batch_queries if query not in anchor_set]
+
+        if not pending:
             continue
 
-        assigned.update(members)
-        unique_communities.append(members)
+        batch_embeddings = model.encode(
+            pending,
+            batch_size=DEFAULT_EMBED_BATCH_SIZE,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        batch_embeddings = np.asarray(batch_embeddings, dtype=np.float32)
 
-    # Queries not placed in a multi-query community remain singleton clusters.
-    for index in range(len(queries)):
-        if index not in assigned:
-            unique_communities.append([index])
+        similarities = batch_embeddings @ anchor_matrix.T
+        best_indices = np.argmax(similarities, axis=1)
+        best_scores = similarities[
+            np.arange(len(pending)),
+            best_indices,
+        ]
 
-    return unique_communities
+        for query, best_index, score in zip(
+            pending,
+            best_indices.tolist(),
+            best_scores.tolist(),
+        ):
+            if float(score) >= similarity_threshold:
+                cluster_id = str(anchor_cluster_ids[best_index])
+                result[query] = anchor_cluster_info[cluster_id]
+            else:
+                cluster_id = _cluster_id([query])
+                result[query] = {
+                    "cluster_id": cluster_id,
+                    "label": query,
+                    "members": [query],
+                }
+
+    return result
 
 
 def build_cluster_map(
@@ -236,14 +448,16 @@ def build_cluster_map(
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> dict[str, dict]:
     """
-    Build a semantic cluster map from one or more query datasets.
+    Build a scalable semantic cluster map.
 
-    The function preserves the original public interface used by analysis.py.
-    The query universe is deduplicated and sorted before caching, which makes
-    the result independent of workbook row order.
+    All queries remain eligible for aggregation. Only a bounded set of
+    high-value representative queries is passed to AgglomerativeClustering.
+    Remaining queries are embedded in batches and assigned to their nearest
+    representative cluster when similarity meets the threshold.
     """
 
     records: dict[str, str] = {}
+    importance: dict[str, float] = {}
 
     for frame in query_frames:
         if query_column not in frame.columns:
@@ -251,6 +465,15 @@ def build_cluster_map(
                 f"Query column '{query_column}' was not found. "
                 f"Available columns: {frame.columns.tolist()}"
             )
+
+        frame_scores = _frame_query_scores(
+            frame,
+            query_column,
+        )
+        importance.update({
+            query: importance.get(query, 0.0) + score
+            for query, score in frame_scores.items()
+        })
 
         for value in frame[query_column].tolist():
             normalized = _normalize_query(value)
@@ -263,10 +486,14 @@ def build_cluster_map(
     if not queries:
         return {}
 
+    model_name = _normalize_model_name(model_name)
+    max_anchors = DEFAULT_MAX_ANCHORS
+
     cache_key = _cache_key(
         queries,
         model_name,
         similarity_threshold,
+        max_anchors,
     )
     cluster_path, _ = _cache_paths(cache_key)
 
@@ -274,34 +501,99 @@ def build_cluster_map(
     if cached is not None:
         return cached
 
-    embeddings = _load_or_create_embeddings(
+    anchors = _choose_anchors(
         queries,
+        importance,
+        max_anchors,
+    )
+
+    print(
+        f"Semantic clustering: {len(queries):,} queries; "
+        f"using {len(anchors):,} anchors with AgglomerativeClustering."
+    )
+
+    anchor_cache_key = sha256(
+        "\n".join(anchors).encode("utf-8")
+    ).hexdigest()[:24]
+
+    anchor_embeddings = _load_or_create_embeddings(
+        anchors,
         model_name,
-        cache_key,
+        anchor_cache_key,
+        f"{anchor_cache_key}.anchors.npy",
     )
 
     communities = _build_communities(
-        embeddings,
-        queries,
+        anchor_embeddings,
         similarity_threshold,
     )
 
-    result: dict[str, dict] = {}
+    anchor_cluster_ids = np.empty(
+        len(anchors),
+        dtype=object,
+    )
+    anchor_cluster_info: dict[str, dict] = {}
 
     for members in communities:
-        member_queries = [queries[index] for index in members]
+        member_queries = [anchors[index] for index in members]
         cluster_id = _cluster_id(member_queries)
-        label = _choose_cluster_label(members, queries)
-        display_members = [records[query] for query in member_queries]
+        label = _choose_cluster_label(
+            members,
+            anchors,
+            anchor_embeddings,
+        )
 
         info = {
             "cluster_id": cluster_id,
             "label": label,
-            "members": sorted(display_members),
+            "members": sorted(
+                records[query]
+                for query in member_queries
+            ),
         }
+        anchor_cluster_info[cluster_id] = info
 
-        for query in member_queries:
-            result[query] = info
+        for index in members:
+            anchor_cluster_ids[index] = cluster_id
+
+    result: dict[str, dict] = {}
+
+    for index, query in enumerate(anchors):
+        result[query] = anchor_cluster_info[
+            str(anchor_cluster_ids[index])
+        ]
+
+    assigned = _assign_queries_to_anchor_clusters(
+        queries,
+        anchors,
+        anchor_embeddings,
+        anchor_cluster_ids,
+        anchor_cluster_info,
+        model_name,
+        similarity_threshold,
+    )
+
+    for query, info in assigned.items():
+        result[query] = info
+
+    # Rebuild member lists after assignment so every query is represented in
+    # the cluster definition used by aggregation/reporting.
+    definitions: dict[str, dict] = {}
+    for query, info in result.items():
+        cluster_id = info["cluster_id"]
+        definition = definitions.setdefault(
+            cluster_id,
+            {
+                "cluster_id": cluster_id,
+                "label": info.get("label", query),
+                "members": [],
+            },
+        )
+        definition["members"].append(records[query])
+
+    for query, info in result.items():
+        definition = definitions[info["cluster_id"]]
+        info["members"] = sorted(definition["members"])
 
     _save_cached_clusters(
         cluster_path,
@@ -309,6 +601,7 @@ def build_cluster_map(
         queries,
         model_name,
         similarity_threshold,
+        max_anchors,
     )
 
     return result
@@ -318,7 +611,7 @@ def aggregate_query_clusters(
     df: pd.DataFrame,
     columns: dict,
     cluster_map: dict[str, dict],
-    max_member_queries: int = 10,
+    max_member_queries: int = DEFAULT_MAX_MEMBER_QUERIES,
 ) -> list[dict]:
     """
     Aggregate current/comparison GSC metrics by semantic cluster.
